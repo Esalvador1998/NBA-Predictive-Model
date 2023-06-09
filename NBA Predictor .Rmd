@@ -1,0 +1,170 @@
+---
+title: "NBA Predictor"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r echo=FALSE}
+library(rvest)
+library(lubridate)
+library(tidyverse)
+library(stringr)
+library(zoo)
+library(h2o)
+library(lubridate)
+teams<-c("tor", "mil", "den", "gs", "ind", "phi", "okc", "por", "bos", "hou", "lac", "sa",
+         "lal", "utah", "mia", "sac", "min", "bkn", "dal", "no", "cha", "mem", "det", "orl",
+         "wsh", "atl", "phx", "ny", "chi", "cle")
+teams_fullname<-c("Toronto", "Milwaukee", "Denver", "Golden State", "Indiana", "Philadelphia", "Oklahoma City","Portland",
+                  "Boston", "Houston", "LA", "San Antonio", "Los Angeles", "Utah", "Miami", "Sacramento", "Minnesota", "Brooklyn",
+                  "Dallas", "New Orleans", "Charlotte", "Memphis", "Detroit", "Orlando", "Washington", "Atlanta", "Phoenix",
+                  "New York", "Chicago", "Cleveland")
+by_team<-{}
+for (i in 1:length(teams)) {
+  url<-paste0("http://www.espn.com/nba/team/schedule/_/name/", teams[i])
+  #print(url)
+  webpage <- read_html(url)
+  team_table <- html_nodes(webpage, 'table')
+  team_c <- html_table(team_table, fill=TRUE, header = TRUE)[[1]]
+  team_c<-team_c[1:which(team_c$RESULT=="TIME")-1,]
+  team_c$URLTeam<-toupper(teams[i])
+  team_c$FullURLTeam<-(teams_fullname[i])
+  by_team<-rbind(by_team, team_c)
+}
+# remove the postponed games
+by_team<-by_team%>%filter(RESULT!='Postponed')
+
+by_team_mod<-by_team%>%select(-(`Hi Points`:`Hi Assists`))%>%mutate(CleanOpponent = str_replace(str_extract(str_replace(OPPONENT, "^vs",""), "[A-Za-z].+"), " \\*",""), 
+                                                                    HomeAway= ifelse(substr(OPPONENT,1,2)=="vs", "Home", "Away"), WL=`W-L`)%>%
+  separate(WL, c("W", "L"), sep="-")%>%mutate(Tpct=as.numeric(W) / (as.numeric(L)+as.numeric(W)))%>%mutate(dummy=1, Outcome=ifelse(substr(RESULT,1,1)=="W",1,0))%>%
+  group_by(URLTeam)%>%mutate(Rank = row_number(), TeamMatchID=paste0(Rank,URLTeam,HomeAway), TLast10=rollapplyr(Outcome, 10, sum, partial = TRUE)/ rollapplyr(dummy, 10, sum, partial = TRUE))%>%
+  group_by(URLTeam, HomeAway)%>%mutate(Rpct=cumsum(Outcome)/cumsum(dummy), RLast10=rollapplyr(Outcome, 10, sum, partial = TRUE)/ rollapplyr(dummy, 10, sum, partial = TRUE))%>%
+  mutate_at(vars(Rpct, RLast10), funs(lag))%>%group_by(URLTeam)%>%mutate_at(vars(Tpct, TLast10), funs(lag))%>%na.omit()%>%
+  select(TeamMatchID, Rank, DATE, URLTeam, FullURLTeam, CleanOpponent, HomeAway,Tpct,TLast10 , Rpct, RLast10, Outcome)
+
+df <- data.frame(matrix(ncol = 16, nrow = 0))
+x <- c(colnames(by_team_mod), "HRpct", "HRLast10",  "ARpct", "ARLast10")
+colnames(df) <- x
+
+
+for (i in 1:nrow(by_team_mod)) {
+  if(by_team_mod[i,"HomeAway"]=="Home") {
+    df[i,c(1:14)]<-data.frame(by_team_mod[i,c(1:12)], by_team_mod[i,c(10:11)])
+  }
+  else {
+    
+    df[i,c(1:12)]<-by_team_mod[i,c(1:12)]
+    df[i,c(15:16)]<-by_team_mod[i,c(10:11)]
+    
+  }
+}
+
+# fill the NA values with the previous ones, group by team
+
+df<-df%>%group_by(URLTeam)%>%fill(HRpct , HRLast10, ARpct,  ARLast10, .direction=c("down"))%>%ungroup()%>%na.omit()%>%filter(Rank>=10)
+
+# create the home df
+H_df<-df%>%filter(HomeAway=="Home")%>%ungroup()
+colnames(H_df)<-paste0("H_", names(H_df))
+
+
+# create the away df
+A_df<-df%>%filter(HomeAway!="Home")%>%ungroup()
+colnames(A_df)<-paste0("A_", names(A_df))
+
+
+Full_df<-H_df%>%inner_join(A_df, by=c("H_CleanOpponent"="A_FullURLTeam", "H_DATE"="A_DATE"))%>%
+  select(H_DATE, H_URLTeam, A_URLTeam, H_Tpct, H_TLast10, H_HRpct, H_HRLast10, H_ARpct, H_ARLast10, 
+         A_Tpct, A_TLast10, A_HRpct, A_HRLast10, A_ARpct, A_ARLast10,  H_Outcome)
+
+# Build the model
+
+h2o.init()
+Train_h2o<-as.h2o(Full_df)
+
+Train_h2o$H_Outcome<-as.factor(Train_h2o$H_Outcome)
+
+# random forest model
+model1 <- h2o.randomForest(y = 16, x=c(4:15 ), training_frame = Train_h2o, max_depth=4 )
+
+h2o.performance(model1)
+
+#######################
+### most recent by team
+#######################
+
+
+### create an empty data frame and fill it in order to get the summary statistics
+
+
+df <- data.frame(matrix(ncol = 16, nrow = 0))
+x <- c(colnames(by_team_mod), "HRpct", "HRLast10",  "ARpct", "ARLast10")
+colnames(df) <- x
+
+
+for (i in 1:nrow(by_team_mod)) {
+  if(by_team_mod[i,"HomeAway"]=="Home") {
+    df[i,c(1:14)]<-data.frame(by_team_mod[i,c(1:12)], by_team_mod[i,c(10:11)])
+  }
+  else {
+    
+    df[i,c(1:12)]<-by_team_mod[i,c(1:12)]
+    df[i,c(15:16)]<-by_team_mod[i,c(10:11)]
+    
+  }
+}
+
+
+# fill the NA values with the previous ones group by team
+
+m_df<-df%>%group_by(URLTeam)%>%fill(HRpct , HRLast10, ARpct,  ARLast10, .direction=c("down"))%>%ungroup()%>%
+  na.omit()%>%group_by(URLTeam)%>%slice(n())%>%ungroup()
+
+### Make predictions
+
+df<-{}
+a<-c("SA", "SAC", "IND", "BKN", "CHI","MIL","OKC","HOU")
+h<-c("NO","ORL", "TOR", "MIA", "CLE","MEM","DEN","POR")
+
+for (i in 1:length(a)) {
+  
+  
+  
+  th<-m_df%>%filter(URLTeam==h[i])%>%select(Tpct:ARLast10, -Outcome)
+  colnames(th)<-paste0("H_", colnames(th))
+  
+  ta<-m_df%>%filter(URLTeam==a[i])%>%select(Tpct:ARLast10, -Outcome)
+  colnames(ta)<-paste0("A_", colnames(ta))
+  
+  
+  pred_data<-cbind(th,ta)
+  
+  
+  
+  tmp<-data.frame(Away=a[i], Home=h[i],as.data.frame(predict(model1,as.h2o(pred_data))))
+  df<-rbind(df, tmp)
+  
+}
+
+df<-df%>%select(-predict)
+df
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
